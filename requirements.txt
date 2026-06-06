@@ -1,0 +1,5 @@
+# Deploy / free-tier set (no torch) — used by the live host.
+dash>=2.16
+plotly>=5.20
+gunicorn>=21.2
+vaderSentiment>=3.3.2

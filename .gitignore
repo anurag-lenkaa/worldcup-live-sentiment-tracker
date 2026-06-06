@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.idea/
+.vscode/
+*.log
+# HF model cache (don't commit gigabytes of weights)
+.cache/
+hf_cache/

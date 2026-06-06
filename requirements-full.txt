@@ -1,0 +1,8 @@
+# Full set for local high-accuracy runs with the HF transformer.
+-r requirements.txt
+transformers>=4.40
+torch>=2.2
+
+# --- real data sources (only when you switch SOURCE) ---
+# tweepy>=4.14        # SOURCE=x       (requires PAID X API access)
+# atproto>=0.0.50     # SOURCE=bluesky (free firehose)

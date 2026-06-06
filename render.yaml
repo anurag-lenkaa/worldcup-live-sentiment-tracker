@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: wc-sentiment
+    runtime: python
+    plan: free                       # free dyno (sleeps after 15 min idle, 512MB RAM)
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:server --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SOURCE
+        value: replay                # replay | x | bluesky
+      - key: SENTIMENT_BACKEND
+        value: vader                 # vader fits 512MB; use "transformers" on a 2GB+ plan
