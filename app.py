@@ -395,7 +395,7 @@ def refresh(_):
             fig_time.add_annotation(x=ev["ts"], y=1.08, text="\u26bd " + ev["label"],
                                     showarrow=False, font={"size": 11, "color": "#FF8C9A",
                                                            "family": "Oswald, sans-serif"},
-                                    bgcolor="#FF5A6E1A", borderpad=3)
+                                    bgcolor="rgba(255,90,110,0.10)", borderpad=3)
     fig_time.update_layout(
         title={"text": "NET CROWD SENTIMENT", "font": {"family": "Oswald, sans-serif",
                "size": 15, "color": "#8DA2C0"}, "x": 0.02},
