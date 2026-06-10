@@ -4,21 +4,14 @@ World Cup Live Sentiment Tracker
 Real-time pipeline: ingest tweets -> classify sentiment -> aggregate over a
 rolling window -> overlay goal events -> live Dash dashboard.
 
-Runs out of the box in REPLAY mode (no API key, no cost): it generates realistic
-match chatter whose tone shifts around goal events on a repeating loop, and runs
-that text through a real sentiment model so the analysis is genuine, not faked.
-
-Two sentiment backends (set SENTIMENT_BACKEND):
-  - "transformers"  HF cardiffnlp roberta. High quality. ~1GB+ RAM. Local / paid host.
-  - "vader"         rule-based, tiny, instant, no torch. Fits a 512MB free dyno.
-
-Config is via environment variables so the same code runs locally and on a host.
+Runs out of the box in REPLAY mode (no API key, no cost). Two sentiment backends
+(SENTIMENT_BACKEND): "transformers" (HF roberta, ~1GB RAM) or "vader" (tiny, fits
+a 512MB free dyno). Config is via environment variables.
 
 Local:
-    pip install -r requirements-full.txt      # includes torch + transformers
-    python app.py                             # http://127.0.0.1:8050
-
-Deploy (gunicorn serves `server`; see README):
+    pip install -r requirements-full.txt
+    python app.py                       # http://127.0.0.1:8050
+Deploy:
     gunicorn app:server --workers 1 --threads 8 --timeout 120
 """
 
@@ -42,27 +35,26 @@ SENTIMENT_BACKEND = os.environ.get("SENTIMENT_BACKEND", "transformers")  # trans
 MODEL_NAME = os.environ.get("MODEL_NAME", "cardiffnlp/twitter-roberta-base-sentiment-latest")
 MATCH_QUERY = os.environ.get("MATCH_QUERY", "World Cup OR Mexico OR South Africa")
 PORT = int(os.environ.get("PORT", 8050))
-ROLLING_WINDOW_SEC = 60          # smoothing window for the net-sentiment line
-MAX_BUFFER = 5000                # max tweets kept in memory
-DASH_REFRESH_MS = 2000           # how often the UI repolls the buffer
+ROLLING_WINDOW_SEC = 60
+MAX_BUFFER = 5000
+DASH_REFRESH_MS = 2000
 
-# Replay schedule: goals recur every LOOP_MINUTES so the demo stays lively.
 KICKOFF = datetime.utcnow()
 LOOP_MINUTES = 5.0
 GOAL_SCHEDULE = [(0.5, "Mexico"), (2.0, "South Africa"), (3.5, "Mexico")]
 
 # --------------------------------------------------------------------------- #
-# Shared in-memory stores
+# Shared state
 # --------------------------------------------------------------------------- #
 BUFFER = deque(maxlen=MAX_BUFFER)        # {"ts","text","label","score"}
 BUFFER_LOCK = threading.Lock()
-GOAL_LOG = deque(maxlen=50)              # {"ts","label"} actual goal timestamps
+GOAL_LOG = deque(maxlen=50)              # {"ts","label"}
 GOAL_LOCK = threading.Lock()
+# Self-diagnostics surfaced on the page so you never need to dig through logs.
+STATUS = {"started": False, "attempts": 0, "errors": 0, "last_error": ""}
 
 
 def log_goal(team):
-    """Record a goal at the current time. Replay calls this; for a live match,
-    call it from your sports-feed poller so the red lines mark real goals."""
     with GOAL_LOCK:
         GOAL_LOG.append({"ts": datetime.utcnow(), "label": f"GOAL {team}"})
 
@@ -71,8 +63,6 @@ def log_goal(team):
 # Sentiment
 # --------------------------------------------------------------------------- #
 class SentimentAnalyzer:
-    """Two backends behind one interface."""
-
     def __init__(self, backend=SENTIMENT_BACKEND, model_name=MODEL_NAME):
         self.backend = backend
         self._model_name = model_name
@@ -82,11 +72,11 @@ class SentimentAnalyzer:
         if self.backend == "vader":
             from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
             self._engine = SentimentIntensityAnalyzer()
-            print("[sentiment] loaded VADER")
+            print("[sentiment] loaded VADER", flush=True)
         else:
             from transformers import pipeline
             self._engine = pipeline("sentiment-analysis", model=self._model_name)
-            print(f"[sentiment] loaded {self._model_name}")
+            print(f"[sentiment] loaded {self._model_name}", flush=True)
 
     def classify(self, text):
         if self._engine is None:
@@ -106,13 +96,9 @@ class SentimentAnalyzer:
 
 
 # --------------------------------------------------------------------------- #
-# Tweet sources (pluggable)
+# Tweet sources
 # --------------------------------------------------------------------------- #
 class ReplaySource:
-    """Synthetic but realistic chatter. Tone skews toward whichever team just
-    scored, so the dashboard shows a genuine swing on each goal — and the text is
-    still classified by the real model, so the sentiment output is honest."""
-
     POS = [
         "What a goal!! {team} are unstoppable today, absolutely buzzing",
         "{team} deserve this, brilliant football, so proud right now",
@@ -167,9 +153,7 @@ class ReplaySource:
 
 
 class XApiSource:
-    """X API v2 filtered stream via Tweepy's modern StreamingClient.
-    Requires PAID access (pay-per-use ~$0.005/read in 2026). The v1.1
-    AppAuthHandler / api.search pattern from older tutorials no longer works."""
+    """X API v2 filtered stream via Tweepy StreamingClient. Requires PAID access."""
 
     def __init__(self, bearer_token, query=MATCH_QUERY):
         self.bearer_token = bearer_token
@@ -195,7 +179,7 @@ class XApiSource:
 
 
 class BlueskySource:
-    """Free alternative: Bluesky firehose via `atproto`. No paid tier."""
+    """Free firehose via atproto. No paid tier."""
 
     def __init__(self, keywords=("world cup", "mexico", "south africa")):
         self.keywords = [k.lower() for k in keywords]
@@ -232,49 +216,114 @@ def make_source():
 
 
 # --------------------------------------------------------------------------- #
-# Ingestion worker
+# Ingestion worker + lazy starter
 # --------------------------------------------------------------------------- #
 def ingestion_loop():
+    STATUS["started"] = True
+    print(f"[ingest] source={SOURCE} backend={SENTIMENT_BACKEND}", flush=True)
     analyzer = SentimentAnalyzer()
-    source = make_source()
-    print(f"[ingest] source={SOURCE} backend={SENTIMENT_BACKEND}")
+    try:
+        source = make_source()
+    except Exception as exc:
+        STATUS["last_error"] = f"source init: {exc}"
+        print(f"[ingest] source init failed: {exc}", flush=True)
+        return
     for text in source.stream():
         if not text:
             continue
+        STATUS["attempts"] += 1
         try:
             label, score = analyzer.classify(text)
         except Exception as exc:
-            print(f"[ingest] classify error: {exc}")
+            STATUS["errors"] += 1
+            STATUS["last_error"] = str(exc)
             continue
         with BUFFER_LOCK:
             BUFFER.append({"ts": datetime.utcnow(), "text": text,
                            "label": label, "score": score})
 
 
+_start_lock = threading.Lock()
+
+
+def ensure_ingestion():
+    """Idempotent: guarantees one ingestion thread runs in THIS process. Called
+    both at import and from the callback, so it works regardless of how the host
+    forks workers."""
+    with _start_lock:
+        if not STATUS["started"]:
+            STATUS["started"] = True  # set immediately to avoid a race
+            threading.Thread(target=ingestion_loop, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- #
 # Dash app
 # --------------------------------------------------------------------------- #
-app = dash.Dash(__name__)
-server = app.server          # <-- gunicorn entry point (gunicorn app:server)
+FONTS = "https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&display=swap"
+app = dash.Dash(__name__, external_stylesheets=[FONTS])
+server = app.server          # gunicorn entry point: gunicorn app:server
 app.title = "WC Live Sentiment"
+app.index_string = """<!DOCTYPE html>
+<html>
+<head>
+{%metas%}<title>{%title%}</title>{%favicon%}{%css%}
+<style>
+  :root{
+    --bg:#0A1422; --panel:#101E33; --panel2:#0D1929; --line:#1C3050;
+    --ink:#EAF2FF; --ink-dim:#8DA2C0;
+    --pos:#27E07D; --neg:#FF5A6E; --neu:#F4B942;
+  }
+  html,body{margin:0;background:
+    radial-gradient(1200px 500px at 70% -10%, #14304F 0%, transparent 60%),
+    radial-gradient(900px 400px at 10% 110%, #0F2A3F 0%, transparent 55%),
+    var(--bg);
+    color:var(--ink); font-family:Inter,system-ui,sans-serif;}
+  .wrap{max-width:1020px;margin:0 auto;padding:28px 20px 48px;}
+  .topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:4px;}
+  .brand{font-family:Oswald,sans-serif;font-weight:700;font-size:30px;letter-spacing:.04em;
+    text-transform:uppercase;}
+  .brand .accent{color:var(--pos);}
+  .live{display:inline-flex;align-items:center;gap:8px;font-family:Oswald,sans-serif;
+    font-weight:600;font-size:13px;letter-spacing:.18em;color:#FF6B7C;
+    border:1px solid #FF5A6E55;border-radius:999px;padding:5px 14px;background:#FF5A6E12;}
+  .live .dot{width:8px;height:8px;border-radius:50%;background:#FF5A6E;
+    animation:pulse 1.4s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}
+  @media (prefers-reduced-motion: reduce){.live .dot{animation:none}}
+  #headline{font-size:13px;color:var(--ink-dim);letter-spacing:.02em;margin:6px 0 18px;}
+  .panel{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);
+    border:1px solid var(--line);border-radius:16px;padding:10px 12px 4px;
+    box-shadow:0 8px 28px #00000040;}
+  .row{display:flex;gap:16px;flex-wrap:wrap;margin-top:16px;}
+  .ticker-title{font-family:Oswald,sans-serif;font-weight:600;font-size:14px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--ink-dim);
+    padding:14px 14px 8px;}
+  #recent{padding:0 12px 12px;}
+  #recent > div{border-left-width:3px !important;border-radius:0 8px 8px 0;
+    background:#FFFFFF08;color:var(--ink);}
+</style>
+{%scripts%}
+</head>
+<body>{%app_entry%}<footer>{%config%}{%renderer%}</footer></body>
+</html>"""
 
-app.layout = html.Div(
-    style={"fontFamily": "system-ui, sans-serif", "maxWidth": "980px",
-           "margin": "0 auto", "padding": "16px"},
-    children=[
-        html.H2("World Cup - Live Sentiment Tracker"),
-        html.Div(id="headline", style={"fontSize": "15px", "color": "#555"}),
-        dcc.Graph(id="timeline"),
-        html.Div(style={"display": "flex", "gap": "16px", "flexWrap": "wrap"}, children=[
-            dcc.Graph(id="distribution", style={"flex": "1 1 320px"}),
-            html.Div(style={"flex": "1 1 320px"}, children=[
-                html.H4("Latest reactions"),
-                html.Div(id="recent"),
-            ]),
+app.layout = html.Div(className="wrap", children=[
+    html.Div(className="topbar", children=[
+        html.Div(["WORLD CUP ", html.Span("SENTIMENT", className="accent")], className="brand"),
+        html.Div([html.Span(className="dot"), "LIVE"], className="live"),
+    ]),
+    html.Div(id="headline"),
+    html.Div(className="panel", children=[dcc.Graph(id="timeline", config={"displayModeBar": False})]),
+    html.Div(className="row", children=[
+        html.Div(className="panel", style={"flex": "1 1 320px"},
+                 children=[dcc.Graph(id="distribution", config={"displayModeBar": False})]),
+        html.Div(className="panel", style={"flex": "1 1 320px"}, children=[
+            html.Div("Fan reactions - live ticker", className="ticker-title"),
+            html.Div(id="recent"),
         ]),
-        dcc.Interval(id="tick", interval=DASH_REFRESH_MS, n_intervals=0),
-    ],
-)
+    ]),
+    dcc.Interval(id="tick", interval=DASH_REFRESH_MS, n_intervals=0),
+])
 
 
 def _snapshot():
@@ -288,10 +337,14 @@ def _snapshot():
     [Input("tick", "n_intervals")],
 )
 def refresh(_):
+    ensure_ingestion()                       # start the worker in the serving process
     data = _snapshot()
     if not data:
         empty = go.Figure()
-        return empty, empty, "Waiting for tweets...", "Starting up - loading model..."
+        diag = (f"Warming up - ingestion {'running' if STATUS['started'] else 'idle'}, "
+                f"{STATUS['attempts']} pulled, {STATUS['errors']} errors"
+                + (f" - last error: {STATUS['last_error']}" if STATUS["last_error"] else ""))
+        return empty, empty, "Waiting for tweets...", diag
 
     score_map = {"POS": 1, "NEU": 0, "NEG": -1}
     buckets = {}
@@ -306,18 +359,31 @@ def refresh(_):
         smoothed.append(sum(win) / len(win))
 
     fig_time = go.Figure()
-    fig_time.add_trace(go.Scatter(x=times, y=smoothed, mode="lines",
-                                  name="net sentiment", line={"width": 3}))
-    fig_time.add_hline(y=0, line_dash="dot", line_color="#aaa")
+    fig_time.add_trace(go.Scatter(
+        x=times, y=smoothed, mode="lines", name="net sentiment",
+        line={"width": 3, "color": "#27E07D", "shape": "spline", "smoothing": 0.6},
+        fill="tozeroy", fillcolor="rgba(39,224,125,0.10)"))
+    fig_time.add_hline(y=0, line_dash="dot", line_color="#3A4F70")
     with GOAL_LOCK:
         goals = list(GOAL_LOG)
     for ev in goals:
         if times[0] <= ev["ts"] <= times[-1] + timedelta(seconds=5):
-            fig_time.add_vline(x=ev["ts"], line_color="#e63946", line_dash="dash")
-            fig_time.add_annotation(x=ev["ts"], y=1, text=ev["label"],
-                                    showarrow=False, font={"size": 10})
-    fig_time.update_layout(title="Net sentiment over time (1 = all positive)",
-                           yaxis_range=[-1.05, 1.15], margin=dict(t=40, b=20), height=340)
+            fig_time.add_vline(x=ev["ts"], line_color="#FF5A6E", line_dash="dash")
+            fig_time.add_annotation(x=ev["ts"], y=1.08, text="\u26bd " + ev["label"],
+                                    showarrow=False, font={"size": 11, "color": "#FF8C9A",
+                                                           "family": "Oswald, sans-serif"},
+                                    bgcolor="#FF5A6E1A", borderpad=3)
+    fig_time.update_layout(
+        title={"text": "NET CROWD SENTIMENT", "font": {"family": "Oswald, sans-serif",
+               "size": 15, "color": "#8DA2C0"}, "x": 0.02},
+        yaxis_range=[-1.05, 1.2], margin=dict(t=46, b=24, l=36, r=18), height=340,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"family": "Inter, sans-serif", "color": "#8DA2C0", "size": 11},
+        xaxis={"gridcolor": "#1C3050", "zerolinecolor": "#1C3050"},
+        yaxis={"gridcolor": "#1C3050", "zerolinecolor": "#3A4F70",
+               "tickvals": [-1, 0, 1],
+               "ticktext": ["all negative", "neutral", "all positive"]},
+        showlegend=False)
 
     counts = {"POS": 0, "NEU": 0, "NEG": 0}
     for d in data:
@@ -325,27 +391,39 @@ def refresh(_):
     fig_dist = go.Figure(go.Pie(
         labels=["Positive", "Neutral", "Negative"],
         values=[counts["POS"], counts["NEU"], counts["NEG"]],
-        marker={"colors": ["#2a9d8f", "#e9c46a", "#e76f51"]}, hole=0.45))
-    fig_dist.update_layout(title="Sentiment mix", height=300, margin=dict(t=40, b=10))
+        marker={"colors": ["#27E07D", "#F4B942", "#FF5A6E"],
+                "line": {"color": "#0A1422", "width": 3}},
+        hole=0.62, textinfo="percent",
+        textfont={"family": "Oswald, sans-serif", "size": 13, "color": "#EAF2FF"}))
+    fig_dist.add_annotation(text=f"<b>{counts['POS']+counts['NEU']+counts['NEG']}</b><br>reactions",
+                            showarrow=False, font={"size": 14, "color": "#EAF2FF",
+                                                   "family": "Oswald, sans-serif"})
+    fig_dist.update_layout(
+        title={"text": "SENTIMENT MIX", "font": {"family": "Oswald, sans-serif",
+               "size": 15, "color": "#8DA2C0"}, "x": 0.02},
+        height=300, margin=dict(t=46, b=14),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend={"font": {"color": "#8DA2C0", "family": "Inter, sans-serif"},
+                "orientation": "h", "y": -0.08})
 
-    color = {"POS": "#2a9d8f", "NEU": "#b08900", "NEG": "#e76f51"}
+    color = {"POS": "#27E07D", "NEU": "#F4B942", "NEG": "#FF5A6E"}
     recent = [
-        html.Div(style={"borderLeft": f"4px solid {color[d['label']]}",
-                        "padding": "4px 8px", "margin": "4px 0", "fontSize": "13px"},
-                 children=f"[{d['label']}] {d['text']}")
+        html.Div(style={"borderLeft": f"3px solid {color[d['label']]}",
+                        "padding": "6px 10px", "margin": "6px 0", "fontSize": "13px",
+                        "lineHeight": "1.45"},
+                 children=d["text"])
         for d in data[-8:][::-1]
     ]
 
     total = len(data)
-    headline = (f"{total} reactions analysed - {100*counts['POS']/total:.0f}% positive "
-                f"- source: {SOURCE} - backend: {SENTIMENT_BACKEND}")
+    headline = (f"{total} reactions analysed  \u00b7  {100*counts['POS']/total:.0f}% positive  "
+                f"\u00b7  source: {SOURCE}  \u00b7  engine: {SENTIMENT_BACKEND}")
     return fig_time, fig_dist, recent, headline
 
 
-# Start ingestion at import time so it also runs under gunicorn (single worker).
-# Tests set DISABLE_INGESTION=1 to skip it.
+# Start at import too (belt and suspenders); the callback also ensures it.
 if os.environ.get("DISABLE_INGESTION") != "1":
-    threading.Thread(target=ingestion_loop, daemon=True).start()
+    ensure_ingestion()
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=PORT)
