@@ -27,6 +27,14 @@ from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 
+# Import the light engine in the MAIN thread at module load. Importing inside a
+# worker thread that was spawned during module import can deadlock on Python's
+# import lock (race only visible on slow CPUs, e.g. free-tier dynos).
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as _VaderEngine
+except ImportError:
+    _VaderEngine = None
+
 # --------------------------------------------------------------------------- #
 # Config (env-overridable)
 # --------------------------------------------------------------------------- #
@@ -71,8 +79,9 @@ class SentimentAnalyzer:
 
     def _load(self):
         if self.backend == "vader":
-            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-            self._engine = SentimentIntensityAnalyzer()
+            if _VaderEngine is None:
+                raise RuntimeError("vaderSentiment is not installed")
+            self._engine = _VaderEngine()
             print("[sentiment] loaded VADER", flush=True)
         else:
             from transformers import pipeline
@@ -435,9 +444,12 @@ def refresh(_):
     return fig_time, fig_dist, recent, headline
 
 
-# Start at import too (belt and suspenders); the callback also ensures it.
-if os.environ.get("DISABLE_INGESTION") != "1":
-    ensure_ingestion()
+# NOTE: ingestion is deliberately NOT started at import time. Spawning a thread
+# during module import can deadlock on the import lock under gunicorn (seen on
+# slow free-tier CPUs). The first Dash callback calls ensure_ingestion(), which
+# is guaranteed to run after imports complete.
 
 if __name__ == "__main__":
+    if os.environ.get("DISABLE_INGESTION") != "1":
+        ensure_ingestion()
     app.run(debug=False, host="0.0.0.0", port=PORT)
