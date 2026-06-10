@@ -51,7 +51,8 @@ BUFFER_LOCK = threading.Lock()
 GOAL_LOG = deque(maxlen=50)              # {"ts","label"}
 GOAL_LOCK = threading.Lock()
 # Self-diagnostics surfaced on the page so you never need to dig through logs.
-STATUS = {"started": False, "attempts": 0, "errors": 0, "last_error": ""}
+STATUS = {"started": False, "stage": "idle", "attempts": 0, "errors": 0,
+          "last_error": "", "beat": 0.0}
 
 
 def log_goal(team):
@@ -118,9 +119,10 @@ class ReplaySource:
         "Anyone know the lineup change for {team}?",
     ]
 
-    def __init__(self, teams=("Mexico", "South Africa")):
+    def __init__(self, teams=("Mexico", "South Africa"), burst=30):
         self.teams = teams
         self._fired = set()
+        self._burst = burst
 
     def _mood_for_now(self):
         now = datetime.utcnow()
@@ -149,7 +151,10 @@ class ReplaySource:
                 tmpl = random.choice(self.POS + self.NEG + self.NEU)
                 subj = random.choice(self.teams)
             yield tmpl.format(team=subj)
-            time.sleep(random.uniform(0.15, 0.5))
+            if self._burst > 0:
+                self._burst -= 1          # instant prime so the page fills fast
+            else:
+                time.sleep(random.uniform(0.15, 0.5))
 
 
 class XApiSource:
@@ -220,27 +225,34 @@ def make_source():
 # --------------------------------------------------------------------------- #
 def ingestion_loop():
     STATUS["started"] = True
+    STATUS["beat"] = time.time()
     print(f"[ingest] source={SOURCE} backend={SENTIMENT_BACKEND}", flush=True)
-    analyzer = SentimentAnalyzer()
     try:
+        STATUS["stage"] = "loading engine"
+        analyzer = SentimentAnalyzer()
+        analyzer.classify("warm up engine now")     # force load up front
+        STATUS["stage"] = "engine ready"
+        STATUS["beat"] = time.time()
         source = make_source()
-    except Exception as exc:
-        STATUS["last_error"] = f"source init: {exc}"
-        print(f"[ingest] source init failed: {exc}", flush=True)
-        return
-    for text in source.stream():
-        if not text:
-            continue
-        STATUS["attempts"] += 1
-        try:
-            label, score = analyzer.classify(text)
-        except Exception as exc:
-            STATUS["errors"] += 1
-            STATUS["last_error"] = str(exc)
-            continue
-        with BUFFER_LOCK:
-            BUFFER.append({"ts": datetime.utcnow(), "text": text,
-                           "label": label, "score": score})
+        STATUS["stage"] = "streaming"
+        for text in source.stream():
+            STATUS["beat"] = time.time()
+            if not text:
+                continue
+            STATUS["attempts"] += 1
+            try:
+                label, score = analyzer.classify(text)
+            except Exception as exc:
+                STATUS["errors"] += 1
+                STATUS["last_error"] = str(exc)
+                continue
+            with BUFFER_LOCK:
+                BUFFER.append({"ts": datetime.utcnow(), "text": text,
+                               "label": label, "score": score})
+    except BaseException as exc:                    # NOTHING dies silently
+        STATUS["stage"] = "crashed"
+        STATUS["last_error"] = f"{exc.__class__.__name__}: {exc}"
+        print(f"[ingest] FATAL: {STATUS['last_error']}", flush=True)
 
 
 _start_lock = threading.Lock()
@@ -341,9 +353,11 @@ def refresh(_):
     data = _snapshot()
     if not data:
         empty = go.Figure()
-        diag = (f"Warming up - ingestion {'running' if STATUS['started'] else 'idle'}, "
-                f"{STATUS['attempts']} pulled, {STATUS['errors']} errors"
-                + (f" - last error: {STATUS['last_error']}" if STATUS["last_error"] else ""))
+        beat_age = (time.time() - STATUS["beat"]) if STATUS["beat"] else -1
+        diag = (f"Warming up \u00b7 stage: {STATUS['stage']} \u00b7 "
+                f"{STATUS['attempts']} pulled \u00b7 {STATUS['errors']} errors \u00b7 "
+                f"heartbeat {beat_age:.0f}s ago \u00b7 {SOURCE}/{SENTIMENT_BACKEND}"
+                + (f" \u00b7 last error: {STATUS['last_error']}" if STATUS["last_error"] else ""))
         return empty, empty, "Waiting for tweets...", diag
 
     score_map = {"POS": 1, "NEU": 0, "NEG": -1}
